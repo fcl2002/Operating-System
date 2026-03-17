@@ -17,18 +17,21 @@
 char buf[LBUF+1];
 struct sockaddr_in SockConf; /* pour les operation du serveur : mise a zero */
 
-char * addrip(unsigned long A)
+char *addrip(unsigned long host_ip)
 {
 static char b[16];
-  sprintf(b,"%u.%u.%u.%u",(unsigned int)(A>>24&0xFF),(unsigned int)(A>>16&0xFF),
-         (unsigned int)(A>>8&0xFF),(unsigned int)(A&0xFF));
+  sprintf(b,"%u.%u.%u.%u",(unsigned int)(host_ip>>24&0xFF),(unsigned int)(host_ip>>16&0xFF),
+         (unsigned int)(host_ip>>8&0xFF),(unsigned int)(host_ip&0xFF));
   return b;
 }
 
-int main(int N, char*P[]) {
+int main(int argc, char *argv[]) {
   int sid, n;
-  struct sockaddr_in Sock;
-  socklen_t ls;
+  struct sockaddr_in from_addr;
+  socklen_t from_len;
+
+    (void)argc;
+    (void)argv;
 
     /* creation du socket */
     if ((sid=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP)) < 0) {
@@ -44,16 +47,16 @@ int main(int N, char*P[]) {
     }
     printf("Le serveur est attache au port %d !\n",PORT);
     for (;;) {
-      ls = sizeof(Sock);
+      from_len = sizeof(from_addr);
       /* on attend un message */
-      if ((n=recvfrom(sid,(void*)buf,LBUF,0,(struct sockaddr *)&Sock,&ls))
+      if ((n=recvfrom(sid,(void*)buf,LBUF,0,(struct sockaddr *)&from_addr,&from_len))
            == -1)  perror("recvfrom");
       else {
         buf[n] = '\0';
-        printf ("Reçu de %s : <%s>\n",addrip(ntohl(Sock.sin_addr.s_addr)), buf);
+        printf ("Reçu de %s : <%s>\n",addrip(ntohl(from_addr.sin_addr.s_addr)), buf);
 
         const char *ack = "Bien recu 5/5 !";
-        if (sendto(sid, ack, strlen(ack), 0, (struct sockaddr *)&Sock, ls) == -1) {
+        if (sendto(sid, ack, strlen(ack), 0, (struct sockaddr *)&from_addr, from_len) == -1) {
             perror("sendto");
         }
       }

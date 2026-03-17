@@ -1,5 +1,5 @@
 CC = cc
-CFLAGS = -Wall
+CFLAGS = -Wall -Werror
 CREME_VER = 1.0.0
 CREME_SO = libcreme.so.$(CREME_VER)
 

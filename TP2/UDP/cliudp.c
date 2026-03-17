@@ -13,22 +13,22 @@
 #include <netinet/in.h>
 
 /* parametres :
-        P[1] = nom de la machine serveur
-        P[2] = port
-        P[3] = message
+        argv[1] = nom de la machine serveur
+        argv[2] = port
+        argv[3] = message
 */
-int main(int N, char*P[])
+int main(int argc, char *argv[])
 {
 int sid;
-struct hostent *h;
-struct sockaddr_in Sock;
-struct sockaddr_in From;
+struct hostent *server_host;
+struct sockaddr_in server_addr;
+struct sockaddr_in from_addr;
 socklen_t from_len;
 char ack[256];
 ssize_t ack_len;
 
-    if (N != 4) {
-        fprintf(stderr,"Utilisation : %s nom_serveur port message\n", P[0]);
+    if (argc != 4) {
+        fprintf(stderr,"Utilisation : %s nom_serveur port message\n", argv[0]);
         return(1);
     }
     /* creation du socket */
@@ -37,25 +37,25 @@ ssize_t ack_len;
         return(2);
     }
     /* recuperation adresse du serveur */
-    if (!(h=gethostbyname(P[1]))) {
-        perror(P[1]);
+    if (!(server_host=gethostbyname(argv[1]))) {
+        perror(argv[1]);
         return(3);
     }
-    bzero(&Sock,sizeof(Sock));
-    Sock.sin_family = AF_INET;
-    bcopy(h->h_addr,&Sock.sin_addr,h->h_length);
-    Sock.sin_port = htons(atoi(P[2]));
-    if (sendto(sid,P[3],strlen(P[3]),MSG_CONFIRM,(struct sockaddr *)&Sock,
-                           sizeof(Sock))==-1) {
+    bzero(&server_addr,sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    bcopy(server_host->h_addr,&server_addr.sin_addr,server_host->h_length);
+    server_addr.sin_port = htons(atoi(argv[2]));
+    if (sendto(sid,argv[3],strlen(argv[3]),MSG_CONFIRM,(struct sockaddr *)&server_addr,
+                           sizeof(server_addr))==-1) {
         perror("sendto");
         return(4);
     }
     printf("Envoi OK !\n");
 
     /* Wait for server acknowledgement datagram. */
-    from_len = sizeof(From);
+    from_len = sizeof(from_addr);
     ack_len = recvfrom(sid, ack, sizeof(ack) - 1, 0,
-                       (struct sockaddr *)&From, &from_len);
+                       (struct sockaddr *)&from_addr, &from_len);
     if (ack_len < 0) {
         perror("recvfrom");
         return(5);

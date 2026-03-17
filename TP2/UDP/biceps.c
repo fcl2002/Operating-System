@@ -182,12 +182,89 @@ static int command_beuip_stop(void)
     return 4;
 }
 
+static int init_local_destination(struct sockaddr_in *dst)
+{
+    memset(dst, 0, sizeof(*dst));
+    dst->sin_family = AF_INET;
+    dst->sin_port = htons(CREME_PORT);
+    if (inet_aton("127.0.0.1", &dst->sin_addr) == 0) {
+        fprintf(stderr, "Invalid local destination address\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int mess_list(int sid, const struct sockaddr_in *dst)
+{
+    if (creme_send_list_cmd(sid, dst) == -1) {
+        perror("sendto(list)");
+        return 3;
+    }
+    printf("mess list sent\n");
+    return 0;
+}
+
+static int mess_to(int sid, const struct sockaddr_in *dst, int argc, char *argv[])
+{
+    int rc;
+    char text[700];
+
+    if (argc < 5) {
+        fprintf(stderr, "Usage: biceps mess to <pseudo> <message>\n");
+        return 4;
+    }
+
+    if (!build_text_from_args(4, argc, argv, text, sizeof(text))) {
+        fprintf(stderr, "Message too long\n");
+        return 5;
+    }
+
+    rc = creme_send_message_cmd(sid, dst, argv[3], text);
+    if (rc == -1) {
+        perror("sendto(to)");
+        return 6;
+    }
+    if (rc == -2) {
+        fprintf(stderr, "Message too long for protocol frame\n");
+        return 7;
+    }
+    printf("mess to sent: pseudo=%s text=%s\n", argv[3], text);
+    return 0;
+}
+
+static int mess_all(int sid, const struct sockaddr_in *dst, int argc, char *argv[])
+{
+    int rc;
+    char text[700];
+
+    if (argc < 4) {
+        fprintf(stderr, "Usage: biceps mess all <message>\n");
+        return 8;
+    }
+
+    if (!build_text_from_args(3, argc, argv, text, sizeof(text))) {
+        fprintf(stderr, "Message too long\n");
+        return 9;
+    }
+
+    rc = creme_send_all_cmd(sid, dst, text);
+    if (rc == -1) {
+        perror("sendto(all)");
+        return 10;
+    }
+    if (rc == -2) {
+        fprintf(stderr, "Message too long for protocol frame\n");
+        return 11;
+    }
+    printf("mess all sent: text=%s\n", text);
+    return 0;
+}
+
 static int command_mess(int argc, char *argv[])
 {
     int sid;
     int rc;
     struct sockaddr_in dst;
-    char text[700];
 
     if (argc < 3) {
         fprintf(stderr, "Usage: biceps mess list | to <pseudo> <message> | all <message>\n");
@@ -200,79 +277,24 @@ static int command_mess(int argc, char *argv[])
         return 2;
     }
 
-    memset(&dst, 0, sizeof(dst));
-    dst.sin_family = AF_INET;
-    dst.sin_port = htons(CREME_PORT);
-    inet_aton("127.0.0.1", &dst.sin_addr);
+    if (!init_local_destination(&dst)) {
+        close(sid);
+        return 13;
+    }
 
     if (strcmp(argv[2], "list") == 0) {
-        rc = creme_send_list_cmd(sid, &dst);
-        close(sid);
-        if (rc == -1) {
-            perror("sendto(list)");
-            return 3;
-        }
-        printf("mess list sent\n");
-        return 0;
-    }
-
-    if (strcmp(argv[2], "to") == 0) {
-        if (argc < 5) {
-            close(sid);
-            fprintf(stderr, "Usage: biceps mess to <pseudo> <message>\n");
-            return 4;
-        }
-
-        if (!build_text_from_args(4, argc, argv, text, sizeof(text))) {
-            close(sid);
-            fprintf(stderr, "Message too long\n");
-            return 5;
-        }
-
-        rc = creme_send_message_cmd(sid, &dst, argv[3], text);
-        close(sid);
-        if (rc == -1) {
-            perror("sendto(to)");
-            return 6;
-        }
-        if (rc == -2) {
-            fprintf(stderr, "Message too long for protocol frame\n");
-            return 7;
-        }
-        printf("mess to sent: pseudo=%s text=%s\n", argv[3], text);
-        return 0;
-    }
-
-    if (strcmp(argv[2], "all") == 0) {
-        if (argc < 4) {
-            close(sid);
-            fprintf(stderr, "Usage: biceps mess all <message>\n");
-            return 8;
-        }
-
-        if (!build_text_from_args(3, argc, argv, text, sizeof(text))) {
-            close(sid);
-            fprintf(stderr, "Message too long\n");
-            return 9;
-        }
-
-        rc = creme_send_all_cmd(sid, &dst, text);
-        close(sid);
-        if (rc == -1) {
-            perror("sendto(all)");
-            return 10;
-        }
-        if (rc == -2) {
-            fprintf(stderr, "Message too long for protocol frame\n");
-            return 11;
-        }
-        printf("mess all sent: text=%s\n", text);
-        return 0;
+        rc = mess_list(sid, &dst);
+    } else if (strcmp(argv[2], "to") == 0) {
+        rc = mess_to(sid, &dst, argc, argv);
+    } else if (strcmp(argv[2], "all") == 0) {
+        rc = mess_all(sid, &dst, argc, argv);
+    } else {
+        fprintf(stderr, "Unknown mess subcommand. Use: list | to | all\n");
+        rc = 12;
     }
 
     close(sid);
-    fprintf(stderr, "Unknown mess subcommand. Use: list | to | all\n");
-    return 12;
+    return rc;
 }
 
 int main(int argc, char *argv[])

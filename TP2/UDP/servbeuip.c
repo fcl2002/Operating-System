@@ -89,17 +89,196 @@ static void remove_peer(uint32_t ip, const char *pseudo)
     }
 }
 
+static int is_supported_code(char code)
+{
+    return code == CREME_CODE_QUIT || code == CREME_CODE_DISCOVERY || code == CREME_CODE_ACK ||
+           code == CREME_CODE_LIST || code == CREME_CODE_SEND_TO_PSEUDO ||
+           code == CREME_CODE_SEND_TO_ALL || code == CREME_CODE_DELIVER;
+}
+
+static int extract_peer_pseudo(const char *buf, int msg_len, char *peer_pseudo)
+{
+    int payload_len;
+
+    payload_len = msg_len - (1 + CREME_MAGIC_LEN);
+    if (payload_len <= 0) {
+        return 0;
+    }
+    if (payload_len > CREME_LBUF) {
+        payload_len = CREME_LBUF;
+    }
+
+    memcpy(peer_pseudo, buf + 1 + CREME_MAGIC_LEN, (size_t)payload_len);
+    peer_pseudo[payload_len] = '\0';
+    return 1;
+}
+
+static int send_quit_broadcast(int sid, const char *my_pseudo, char *buf, size_t buf_sz)
+{
+    int msg_len;
+    struct sockaddr_in quit_bcast;
+
+    memset(&quit_bcast, 0, sizeof(quit_bcast));
+    quit_bcast.sin_family = AF_INET;
+    quit_bcast.sin_port = htons(CREME_PORT);
+    if (inet_aton(CREME_BCAST_ADDR, &quit_bcast.sin_addr) == 0) {
+        fprintf(stderr, "Invalid broadcast address: %s\n", CREME_BCAST_ADDR);
+        return 0;
+    }
+
+    msg_len = creme_build_message(buf, buf_sz, CREME_CODE_QUIT, my_pseudo);
+    if (msg_len < 0) {
+        return 0;
+    }
+    if (sendto(sid, buf, (size_t)msg_len, 0, (struct sockaddr *)&quit_bcast,
+               sizeof(quit_bcast)) == -1) {
+        perror("sendto(quit)");
+        return 0;
+    }
+    return 1;
+}
+
+static void handle_quit_packet(int msg_len, const char *buf,
+                               const struct sockaddr_in *from, char *peer_pseudo)
+{
+    if (!extract_peer_pseudo(buf, msg_len, peer_pseudo)) {
+        return;
+    }
+    remove_peer(ntohl(from->sin_addr.s_addr), peer_pseudo);
+}
+
+static void handle_send_to_pseudo_packet(int sid, int msg_len, char *buf,
+                                         char *target_pseudo, char *text)
+{
+    int payload_len;
+    int used = 0;
+    int out_len;
+    uint32_t target_ip;
+    struct sockaddr_in dst;
+
+    payload_len = msg_len - (1 + CREME_MAGIC_LEN);
+    if (!creme_extract_cstr(buf + 1 + CREME_MAGIC_LEN, payload_len, target_pseudo,
+                            CREME_LBUF + 1, &used)) {
+        return;
+    }
+    if (!creme_copy_payload_text(buf + 1 + CREME_MAGIC_LEN + used, payload_len - used,
+                                 text, CREME_LBUF + 1)) {
+        return;
+    }
+    if (!creme_find_ip_by_pseudo(peers, peer_count, target_pseudo, &target_ip)) {
+        printf("[!] unknown pseudo: %s\n", target_pseudo);
+        return;
+    }
+
+    out_len = creme_build_message(buf, CREME_LBUF + 1, CREME_CODE_DELIVER, text);
+    if (out_len < 0) {
+        return;
+    }
+
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(CREME_PORT);
+    dst.sin_addr.s_addr = htonl(target_ip);
+    if (sendto(sid, buf, (size_t)out_len, 0, (struct sockaddr *)&dst, sizeof(dst)) == -1) {
+        perror("sendto(deliver)");
+    }
+}
+
+static void handle_send_to_all_packet(int sid, int msg_len, const char *my_pseudo,
+                                      char *buf, char *text)
+{
+    int payload_len;
+    int out_len;
+    int i;
+
+    payload_len = msg_len - (1 + CREME_MAGIC_LEN);
+    if (!creme_copy_payload_text(buf + 1 + CREME_MAGIC_LEN, payload_len, text, CREME_LBUF + 1)) {
+        return;
+    }
+
+    out_len = creme_build_message(buf, CREME_LBUF + 1, CREME_CODE_DELIVER, text);
+    if (out_len < 0) {
+        return;
+    }
+
+    for (i = 0; i < peer_count; ++i) {
+        struct sockaddr_in dst;
+
+        if (strcmp(peers[i].pseudo, my_pseudo) == 0) {
+            continue;
+        }
+
+        memset(&dst, 0, sizeof(dst));
+        dst.sin_family = AF_INET;
+        dst.sin_port = htons(CREME_PORT);
+        dst.sin_addr.s_addr = htonl(peers[i].ip);
+        if (sendto(sid, buf, (size_t)out_len, 0, (struct sockaddr *)&dst, sizeof(dst)) == -1) {
+            perror("sendto(all)");
+        }
+    }
+}
+
+static void handle_deliver_packet(int msg_len, const char *buf,
+                                  const struct sockaddr_in *from, char *text)
+{
+    int payload_len;
+    const char *sender;
+    char ip_text[16];
+
+    payload_len = msg_len - (1 + CREME_MAGIC_LEN);
+    if (!creme_copy_payload_text(buf + 1 + CREME_MAGIC_LEN, payload_len, text, CREME_LBUF + 1)) {
+        return;
+    }
+
+    sender = creme_find_pseudo_by_ip(peers, peer_count, ntohl(from->sin_addr.s_addr));
+    if (sender) {
+        printf("Message de %s : %s\n", sender, text);
+    } else {
+        creme_addrip(ntohl(from->sin_addr.s_addr), ip_text, sizeof(ip_text));
+        printf("Message de %s : %s\n", ip_text, text);
+    }
+}
+
+static int install_stop_handler(void)
+{
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_stop_signal;
+    if (sigemptyset(&sa.sa_mask) == -1) {
+        perror("sigemptyset");
+        return 0;
+    }
+    sa.sa_flags = 0;
+    if (sigaction(SIGUSR1, &sa, NULL) == -1) {
+        perror("sigaction");
+        return 0;
+    }
+    return 1;
+}
+
+static int set_recv_timeout(int sid)
+{
+    struct timeval tv;
+
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    if (setsockopt(sid, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == -1) {
+        perror("setsockopt(SO_RCVTIMEO)");
+        return 0;
+    }
+    return 1;
+}
+
 int main(int argc, char *argv[])
 {
     int sid;
-    int n;
+    int msg_len;
     int yes = 1;
     struct sockaddr_in sock_conf;
     struct sockaddr_in from;
     struct sockaddr_in bcast;
-    struct timeval tv;
-    struct sigaction sa;
-    socklen_t ls;
+    socklen_t from_len;
     char buf[CREME_LBUF + 1];
     char peer_pseudo[CREME_LBUF + 1];
     char target_pseudo[CREME_LBUF + 1];
@@ -112,27 +291,26 @@ int main(int argc, char *argv[])
     }
     my_pseudo = argv[1];
 
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = on_stop_signal;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGUSR1, &sa, NULL);
+    if (!install_stop_handler()) {
+        return 2;
+    }
 
     sid = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sid < 0) {
         perror("socket");
-        return 2;
+        return 3;
     }
 
     if (setsockopt(sid, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes)) == -1) {
         perror("setsockopt(SO_BROADCAST)");
         close(sid);
-        return 3;
+        return 4;
     }
 
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
-    setsockopt(sid, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (!set_recv_timeout(sid)) {
+        close(sid);
+        return 5;
+    }
 
     memset(&sock_conf, 0, sizeof(sock_conf));
     sock_conf.sin_family = AF_INET;
@@ -142,7 +320,7 @@ int main(int argc, char *argv[])
     if (bind(sid, (struct sockaddr *)&sock_conf, sizeof(sock_conf)) == -1) {
         perror("bind");
         close(sid);
-        return 4;
+        return 6;
     }
 
     memset(&bcast, 0, sizeof(bcast));
@@ -151,20 +329,20 @@ int main(int argc, char *argv[])
     if (inet_aton(CREME_BCAST_ADDR, &bcast.sin_addr) == 0) {
         fprintf(stderr, "Invalid broadcast address: %s\n", CREME_BCAST_ADDR);
         close(sid);
-        return 5;
+        return 7;
     }
 
-    n = creme_build_message(buf, sizeof(buf), CREME_CODE_DISCOVERY, my_pseudo);
-    if (n < 0) {
+    msg_len = creme_build_message(buf, sizeof(buf), CREME_CODE_DISCOVERY, my_pseudo);
+    if (msg_len < 0) {
         fprintf(stderr, "Pseudo too long\n");
         close(sid);
-        return 6;
+        return 8;
     }
 
-    if (sendto(sid, buf, (size_t)n, 0, (struct sockaddr *)&bcast, sizeof(bcast)) == -1) {
+    if (sendto(sid, buf, (size_t)msg_len, 0, (struct sockaddr *)&bcast, sizeof(bcast)) == -1) {
         perror("sendto(broadcast)");
         close(sid);
-        return 7;
+        return 9;
     }
 
     printf("BEUIP server on port %d, pseudo=%s\n", CREME_PORT, my_pseudo);
@@ -173,24 +351,16 @@ int main(int argc, char *argv[])
 
     for (;;) {
         if (stop_requested) {
-            struct sockaddr_in quit_bcast;
-
-            memset(&quit_bcast, 0, sizeof(quit_bcast));
-            quit_bcast.sin_family = AF_INET;
-            quit_bcast.sin_port = htons(CREME_PORT);
-            inet_aton(CREME_BCAST_ADDR, &quit_bcast.sin_addr);
-
-            n = creme_build_message(buf, sizeof(buf), CREME_CODE_QUIT, my_pseudo);
-            if (n > 0) {
-                sendto(sid, buf, (size_t)n, 0, (struct sockaddr *)&quit_bcast, sizeof(quit_bcast));
+            if (!send_quit_broadcast(sid, my_pseudo, buf, sizeof(buf))) {
+                fprintf(stderr, "Failed to send quit broadcast\n");
             }
             printf("Stopping server after quit broadcast\n");
             break;
         }
 
-        ls = sizeof(from);
-        n = recvfrom(sid, buf, CREME_LBUF, 0, (struct sockaddr *)&from, &ls);
-        if (n < 0) {
+        from_len = sizeof(from);
+        msg_len = recvfrom(sid, buf, CREME_LBUF, 0, (struct sockaddr *)&from, &from_len);
+        if (msg_len < 0) {
             if (errno == EINTR) {
                 continue;
             }
@@ -201,13 +371,11 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        if (n < (1 + CREME_MAGIC_LEN)) {
+        if (msg_len < (1 + CREME_MAGIC_LEN)) {
             continue;
         }
 
-        if (buf[0] != CREME_CODE_QUIT && buf[0] != CREME_CODE_DISCOVERY && buf[0] != CREME_CODE_ACK &&
-            buf[0] != CREME_CODE_LIST && buf[0] != CREME_CODE_SEND_TO_PSEUDO &&
-            buf[0] != CREME_CODE_SEND_TO_ALL && buf[0] != CREME_CODE_DELIVER) {
+        if (!is_supported_code(buf[0])) {
             continue;
         }
 
@@ -221,17 +389,7 @@ int main(int argc, char *argv[])
         }
 
         if (buf[0] == CREME_CODE_QUIT) {
-            int payload_len = n - (1 + CREME_MAGIC_LEN);
-            if (payload_len <= 0) {
-                continue;
-            }
-            if (payload_len > CREME_LBUF) {
-                payload_len = CREME_LBUF;
-            }
-
-            memcpy(peer_pseudo, buf + 1 + CREME_MAGIC_LEN, (size_t)payload_len);
-            peer_pseudo[payload_len] = '\0';
-            remove_peer(ntohl(from.sin_addr.s_addr), peer_pseudo);
+            handle_quit_packet(msg_len, buf, &from, peer_pseudo);
             continue;
         }
 
@@ -241,116 +399,32 @@ int main(int argc, char *argv[])
         }
 
         if (buf[0] == CREME_CODE_SEND_TO_PSEUDO) {
-            int payload_len = n - (1 + CREME_MAGIC_LEN);
-            int used = 0;
-            uint32_t target_ip;
-            struct sockaddr_in dst;
-
-            if (!creme_extract_cstr(buf + 1 + CREME_MAGIC_LEN, payload_len, target_pseudo,
-                                    sizeof(target_pseudo), &used)) {
-                continue;
-            }
-
-            if (!creme_copy_payload_text(buf + 1 + CREME_MAGIC_LEN + used, payload_len - used,
-                                         text, sizeof(text))) {
-                continue;
-            }
-
-            if (!creme_find_ip_by_pseudo(peers, peer_count, target_pseudo, &target_ip)) {
-                printf("[!] unknown pseudo: %s\n", target_pseudo);
-                continue;
-            }
-
-            n = creme_build_message(buf, sizeof(buf), CREME_CODE_DELIVER, text);
-            if (n < 0) {
-                continue;
-            }
-
-            memset(&dst, 0, sizeof(dst));
-            dst.sin_family = AF_INET;
-            dst.sin_port = htons(CREME_PORT);
-            dst.sin_addr.s_addr = htonl(target_ip);
-
-            if (sendto(sid, buf, (size_t)n, 0, (struct sockaddr *)&dst, sizeof(dst)) == -1) {
-                perror("sendto(deliver)");
-            }
+            handle_send_to_pseudo_packet(sid, msg_len, buf, target_pseudo, text);
             continue;
         }
 
         if (buf[0] == CREME_CODE_SEND_TO_ALL) {
-            int payload_len = n - (1 + CREME_MAGIC_LEN);
-            int i;
-
-            if (!creme_copy_payload_text(buf + 1 + CREME_MAGIC_LEN, payload_len, text,
-                                         sizeof(text))) {
-                continue;
-            }
-
-            n = creme_build_message(buf, sizeof(buf), CREME_CODE_DELIVER, text);
-            if (n < 0) {
-                continue;
-            }
-
-            for (i = 0; i < peer_count; ++i) {
-                struct sockaddr_in dst;
-
-                if (strcmp(peers[i].pseudo, my_pseudo) == 0) {
-                    continue;
-                }
-
-                memset(&dst, 0, sizeof(dst));
-                dst.sin_family = AF_INET;
-                dst.sin_port = htons(CREME_PORT);
-                dst.sin_addr.s_addr = htonl(peers[i].ip);
-
-                if (sendto(sid, buf, (size_t)n, 0, (struct sockaddr *)&dst, sizeof(dst)) == -1) {
-                    perror("sendto(all)");
-                }
-            }
+            handle_send_to_all_packet(sid, msg_len, my_pseudo, buf, text);
             continue;
         }
 
         if (buf[0] == CREME_CODE_DELIVER) {
-            int payload_len = n - (1 + CREME_MAGIC_LEN);
-            const char *sender;
-            char ip_text[16];
-
-            if (!creme_copy_payload_text(buf + 1 + CREME_MAGIC_LEN, payload_len, text,
-                                         sizeof(text))) {
-                continue;
-            }
-
-            sender = creme_find_pseudo_by_ip(peers, peer_count, ntohl(from.sin_addr.s_addr));
-            if (sender) {
-                printf("Message de %s : %s\n", sender, text);
-            } else {
-                creme_addrip(ntohl(from.sin_addr.s_addr), ip_text, sizeof(ip_text));
-                printf("Message de %s : %s\n", ip_text, text);
-            }
+            handle_deliver_packet(msg_len, buf, &from, text);
             continue;
         }
 
-        {
-            int payload_len = n - (1 + CREME_MAGIC_LEN);
-            if (payload_len <= 0) {
-                continue;
-            }
-            if (payload_len > CREME_LBUF) {
-                payload_len = CREME_LBUF;
-            }
-
-            memcpy(peer_pseudo, buf + 1 + CREME_MAGIC_LEN, (size_t)payload_len);
-            peer_pseudo[payload_len] = '\0';
+        if (!extract_peer_pseudo(buf, msg_len, peer_pseudo)) {
+            continue;
         }
 
         add_peer(ntohl(from.sin_addr.s_addr), peer_pseudo);
 
         if (buf[0] == CREME_CODE_DISCOVERY) {
-            n = creme_build_message(buf, sizeof(buf), CREME_CODE_ACK, my_pseudo);
-            if (n < 0) {
+            msg_len = creme_build_message(buf, sizeof(buf), CREME_CODE_ACK, my_pseudo);
+            if (msg_len < 0) {
                 continue;
             }
-            if (sendto(sid, buf, (size_t)n, 0, (struct sockaddr *)&from, ls) == -1) {
+            if (sendto(sid, buf, (size_t)msg_len, 0, (struct sockaddr *)&from, from_len) == -1) {
                 perror("sendto(ack)");
             }
         }
