@@ -1,0 +1,6 @@
+# .gitignore for UDP project
+UDP/biceps
+UDP/clibeuip
+UDP/cliudp
+UDP/servbeuip
+UDP/servudp
