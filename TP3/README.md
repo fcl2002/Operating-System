@@ -78,6 +78,14 @@ Permet de consulter le `reppub` d'un pair distant.
 - **`demandeListe(char *pseudo)`** (thread principal) : `connect()` TCP port 9998, envoie l'octet `'L'`, lit la réponse jusqu'à EOF et affiche sur stdout.
 - **`envoiContenu(int fd)`** (thread TCP serveur) : lit l'octet de commande ; si `'L'`, `fork()` + `execlp("ls", "-l", reppub)` avec stdout/stderr redirigés sur `fd`.
 
+### Section 3.3 — Commande `beuip get <pseudo> <nomfic>`
+
+Télécharge un fichier depuis le `reppub` d'un pair.
+
+- **`demandeFichier(char *pseudo, char *nomfic)`** : `connect()`, envoie `'F'+nomfic+'\n'`, lit la réponse et sauvegarde dans `reppub/nomfic`.
+- **`envoiContenu`** étendue : si `'F'`, lit le nom jusqu'à `'\n'`, vérifie l'existence avec `access()`, puis `fork()` + `execlp("cat", path)`.
+- Contrôles : pseudo inconnu, nom invalide (`/`, `.`), fichier local déjà présent, fichier distant absent (EOF immédiat → aucun octet reçu).
+
 ---
 
 ## Compilation

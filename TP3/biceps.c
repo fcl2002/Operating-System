@@ -659,6 +659,94 @@ void demandeListe(char *pseudo)
     close(sid);
 }
 
+/*
+ * demandeFichier - télécharge nomfic depuis le reppub du pair pseudo.
+ * Envoie 'F'+nomfic+'\n', lit la réponse et sauvegarde dans reppub/nomfic.
+ * Contrôles : pseudo inconnu, nom invalide, fichier local déjà présent,
+ * fichier distant absent (EOF immédiat).
+ */
+void demandeFichier(char *pseudo, char *nomfic)
+{
+    char               adip[16];
+    int                sid;
+    struct sockaddr_in dst;
+    char               req[300];
+    char               localpath[512];
+    char               buf[4096];
+    ssize_t            n;
+    FILE              *f;
+    int                received;
+
+    if (!findAdipByNom(pseudo, adip, sizeof(adip))) {
+        printf("[!] pseudo inconnu : %s\n", pseudo);
+        return;
+    }
+
+    /* Validation du nom de fichier */
+    if (nomfic[0] == '\0' || strchr(nomfic, '/') != NULL || nomfic[0] == '.') {
+        fprintf(stderr, "[!] nom de fichier invalide : %s\n", nomfic);
+        return;
+    }
+
+    /* Refus si un fichier local du même nom existe déjà */
+    snprintf(localpath, sizeof(localpath), "%s/%s", reppub, nomfic);
+    if (access(localpath, F_OK) == 0) {
+        fprintf(stderr, "[!] fichier '%s' déjà présent localement\n", nomfic);
+        return;
+    }
+
+    sid = socket(AF_INET, SOCK_STREAM, 0);
+    if (sid < 0) { perror("socket"); return; }
+
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_port   = htons(CREME_PORT);
+    if (inet_aton(adip, &dst.sin_addr) == 0) {
+        fprintf(stderr, "Adresse IP invalide : %s\n", adip);
+        close(sid);
+        return;
+    }
+    if (connect(sid, (struct sockaddr *)&dst, sizeof(dst)) == -1) {
+        perror("connect");
+        close(sid);
+        return;
+    }
+
+    /* Envoie 'F' + nom + '\n' */
+    snprintf(req, sizeof(req), "F%s\n", nomfic);
+    if (write(sid, req, strlen(req)) != (ssize_t)strlen(req)) {
+        perror("write");
+        close(sid);
+        return;
+    }
+
+    /* Lire la première réponse pour détecter fichier absent (EOF immédiat) */
+    n = read(sid, buf, sizeof(buf));
+    if (n <= 0) {
+        printf("[!] fichier '%s' absent chez %s\n", nomfic, pseudo);
+        close(sid);
+        return;
+    }
+
+    /* Ouvrir le fichier local et sauvegarder */
+    f = fopen(localpath, "wb");
+    if (f == NULL) {
+        perror("fopen");
+        close(sid);
+        return;
+    }
+
+    received = 0;
+    do {
+        fwrite(buf, 1, (size_t)n, f);
+        received += (int)n;
+    } while ((n = read(sid, buf, sizeof(buf))) > 0);
+
+    fclose(f);
+    close(sid);
+    printf("Fichier '%s' reçu (%d octets) dans %s/\n", nomfic, received, reppub);
+}
+
 static void repl_mess_add(const char *pseudo, const char *ip_str)
 {
     /* Vérifie que l'IP est valide avant d'appeler ajouteElt */
@@ -724,6 +812,14 @@ static void run_repl(void)
                     continue;
                 }
                 demandeListe(args[2]);
+                continue;
+            }
+            if (strcmp(args[1], "get") == 0) {
+                if (argc != 4) {
+                    fprintf(stderr, "Usage: beuip get <pseudo> <nomfic>\n");
+                    continue;
+                }
+                demandeFichier(args[2], args[3]);
                 continue;
             }
             if (strcmp(args[1], "stop") == 0) {
@@ -798,6 +894,7 @@ static void run_repl(void)
             printf("  mess to <pseudo> <message> - envoyer à un pair\n");
             printf("  mess all <message>         - diffuser à tous les pairs\n");
             printf("  beuip ls <pseudo>          - lister les fichiers du reppub d'un pair\n");
+            printf("  beuip get <pseudo> <fic>   - télécharger un fichier depuis le reppub d'un pair\n");
             printf("  beuip stop                 - arrêter les serveurs UDP et TCP\n");
             printf("  quit / exit                - quitter\n");
             continue;
@@ -825,12 +922,18 @@ static void run_repl(void)
  * envoiContenu - gère une connexion cliente TCP.
  * Lit un octet de commande :
  *   'L' → fork + exec "ls -l <reppub>", stdout/stderr redirigés sur fd.
+ *   'F' → lit le nom de fichier jusqu'à '\n', puis fork + exec "cat reppub/nomfic".
+ *          Ferme sans envoyer si le fichier n'existe pas (EOF = fichier absent).
  * fd est fermé avant de retourner.
  */
 void envoiContenu(int fd)
 {
     unsigned char code;
     pid_t         pid;
+    char          filename[256];
+    char          path[512];
+    int           n;
+    unsigned char c;
 
     if (read(fd, &code, 1) != 1) {
         close(fd);
@@ -845,7 +948,6 @@ void envoiContenu(int fd)
             return;
         }
         if (pid == 0) {
-            /* fils : redirige stdout et stderr vers le socket client */
             dup2(fd, STDOUT_FILENO);
             dup2(fd, STDERR_FILENO);
             close(fd);
@@ -853,7 +955,46 @@ void envoiContenu(int fd)
             perror("execlp");
             _exit(1);
         }
-        /* père : attend la fin du ls avant de fermer la connexion */
+        waitpid(pid, NULL, 0);
+
+    } else if (code == 'F') {
+        /* Lire le nom de fichier jusqu'à '\n' */
+        n = 0;
+        while (n < (int)sizeof(filename) - 1) {
+            if (read(fd, &c, 1) != 1) break;
+            if (c == '\n') break;
+            filename[n++] = (char)c;
+        }
+        filename[n] = '\0';
+
+        /* Validation : nom vide, '/' ou commençant par '.' */
+        if (n == 0 || strchr(filename, '/') != NULL || filename[0] == '.') {
+            close(fd);
+            return;
+        }
+
+        snprintf(path, sizeof(path), "%s/%s", reppub, filename);
+
+        /* Si le fichier n'existe pas, fermeture sans envoi (EOF pour le client) */
+        if (access(path, R_OK) != 0) {
+            close(fd);
+            return;
+        }
+
+        pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            close(fd);
+            return;
+        }
+        if (pid == 0) {
+            dup2(fd, STDOUT_FILENO);
+            dup2(fd, STDERR_FILENO);
+            close(fd);
+            execlp("cat", "cat", path, (char *)NULL);
+            perror("execlp");
+            _exit(1);
+        }
         waitpid(pid, NULL, 0);
     }
 
