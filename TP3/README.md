@@ -55,6 +55,31 @@ Trois fonctions obligatoires :
 
 ---
 
+## Étape 3 — Échange de fichiers entre pairs
+
+### Section 3.1 — Thread serveur TCP
+
+Un second thread serveur (`serveur_tcp`) est lancé en parallèle du thread UDP lors du `beuip start`. Il expose un répertoire public (`reppub`, par défaut `pub`) via TCP sur le port 9998.
+
+Protocole ligne à ligne :
+
+| Commande client | Réponse serveur |
+|---|---|
+| `LIST\n` | liste des fichiers (un par ligne), terminée par `.\n` |
+| `GET <nom>\n` | `SIZE <n>\n` suivi des `n` octets du fichier |
+| `BYE\n` | fermeture de la connexion |
+
+- `beuip stop` arrête désormais les **deux** threads (UDP et TCP).
+
+### Section 3.2 — Commande `beuip ls <pseudo>`
+
+Permet de consulter le `reppub` d'un pair distant.
+
+- **`demandeListe(char *pseudo)`** (thread principal) : `connect()` TCP port 9998, envoie l'octet `'L'`, lit la réponse jusqu'à EOF et affiche sur stdout.
+- **`envoiContenu(int fd)`** (thread TCP serveur) : lit l'octet de commande ; si `'L'`, `fork()` + `execlp("ls", "-l", reppub)` avec stdout/stderr redirigés sur `fd`.
+
+---
+
 ## Compilation
 
 ```bash
@@ -64,7 +89,8 @@ make
 ## Utilisation
 
 ```bash
-./biceps beuip start <pseudo> [<ip_locale>]
+./biceps beuip start <pseudo> [<ip_locale>] [<reppub>]
 ```
 
-Le paramètre optionnel `<ip_locale>` permet de tester en local avec deux instances sur des adresses loopback distinctes (`127.0.0.1` et `127.0.0.2`).
+- `<ip_locale>` : adresse locale pour tests multi-instances (`127.0.0.1` / `127.0.0.2`).
+- `<reppub>` : répertoire public TCP (défaut : `pub`). Doit exister avant le démarrage.

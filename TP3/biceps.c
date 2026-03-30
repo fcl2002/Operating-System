@@ -17,6 +17,10 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/select.h>
+#include <sys/wait.h>
 
 /* ------------------------------------------------------------------ */
 /* Variables partagées entre l'interpréteur et le thread serveur UDP  */
@@ -42,6 +46,11 @@ static char local_ip[16]; /* ex: "127.0.0.1" — vide = INADDR_ANY */
 static int        beuip_started = 0;
 static int        beuip_active  = 0;
 static pthread_t  server_tid;
+
+/* Serveur TCP */
+static char      reppub[256] = "pub"; /* répertoire public partagé */
+static pthread_t tcp_tid;
+static int       tcp_active  = 0;
 
 /* ------------------------------------------------------------------ */
 /* Gestion de la liste chaînée de pairs                               */
@@ -599,6 +608,57 @@ static void do_beuip_stop(void)
     stop_requested = 1;
 }
 
+/*
+ * demandeListe - se connecte au serveur TCP du pair pseudo,
+ * envoie l'octet 'L' et affiche la réponse sur stdout jusqu'à EOF.
+ */
+void demandeListe(char *pseudo)
+{
+    char               adip[16];
+    int                sid;
+    struct sockaddr_in dst;
+    char               buf[4096];
+    ssize_t            n;
+
+    if (!findAdipByNom(pseudo, adip, sizeof(adip))) {
+        printf("[!] pseudo inconnu : %s\n", pseudo);
+        return;
+    }
+
+    sid = socket(AF_INET, SOCK_STREAM, 0);
+    if (sid < 0) { perror("socket"); return; }
+
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_port   = htons(CREME_PORT);
+    if (inet_aton(adip, &dst.sin_addr) == 0) {
+        fprintf(stderr, "Adresse IP invalide : %s\n", adip);
+        close(sid);
+        return;
+    }
+
+    if (connect(sid, (struct sockaddr *)&dst, sizeof(dst)) == -1) {
+        perror("connect");
+        close(sid);
+        return;
+    }
+
+    /* Demande la liste avec l'octet 'L' */
+    if (write(sid, "L", 1) != 1) {
+        perror("write");
+        close(sid);
+        return;
+    }
+
+    /* Lit et affiche la réponse jusqu'à EOF */
+    while ((n = read(sid, buf, sizeof(buf) - 1)) > 0) {
+        buf[n] = '\0';
+        fputs(buf, stdout);
+    }
+    fflush(stdout);
+    close(sid);
+}
+
 static void repl_mess_add(const char *pseudo, const char *ip_str)
 {
     /* Vérifie que l'IP est valide avant d'appeler ajouteElt */
@@ -658,6 +718,14 @@ static void run_repl(void)
 
         /* --- beuip stop / beuip start --- */
         if (strcmp(args[0], "beuip") == 0 && argc >= 2) {
+            if (strcmp(args[1], "ls") == 0) {
+                if (argc != 3) {
+                    fprintf(stderr, "Usage: beuip ls <pseudo>\n");
+                    continue;
+                }
+                demandeListe(args[2]);
+                continue;
+            }
             if (strcmp(args[1], "stop") == 0) {
                 if (!beuip_active) {
                     fprintf(stderr, "Serveur non actif\n");
@@ -665,8 +733,9 @@ static void run_repl(void)
                 }
                 do_beuip_stop();
                 pthread_join(server_tid, NULL);
+                if (tcp_active) { pthread_join(tcp_tid, NULL); tcp_active = 0; }
                 beuip_active = 0;
-                printf("Serveur arrêté. Tapez 'quit' pour quitter.\n");
+                printf("Serveurs arrêtés. Tapez 'quit' pour quitter.\n");
                 continue;
             }
             if (strcmp(args[1], "start") == 0) {
@@ -728,7 +797,8 @@ static void run_repl(void)
             printf("  mess list                  - lister les pairs connus\n");
             printf("  mess to <pseudo> <message> - envoyer à un pair\n");
             printf("  mess all <message>         - diffuser à tous les pairs\n");
-            printf("  beuip stop                 - arrêter le serveur UDP\n");
+            printf("  beuip ls <pseudo>          - lister les fichiers du reppub d'un pair\n");
+            printf("  beuip stop                 - arrêter les serveurs UDP et TCP\n");
             printf("  quit / exit                - quitter\n");
             continue;
         }
@@ -736,19 +806,136 @@ static void run_repl(void)
         fprintf(stderr, "Commande inconnue: %s\n", args[0]);
     }
 
-    /* Si on quitte le REPL sans avoir arrêté le serveur, on l'arrête ici */
+    /* Si on quitte le REPL sans avoir arrêté les serveurs, on les arrête ici */
     if (beuip_active) {
         do_beuip_stop();
         pthread_join(server_tid, NULL);
+        if (tcp_active) { pthread_join(tcp_tid, NULL); tcp_active = 0; }
         beuip_active = 0;
     }
+}
+
+/* ------------------------------------------------------------------ */
+/*                       Thread serveur TCP                            */
+/* ------------------------------------------------------------------ */
+
+
+
+/*
+ * envoiContenu - gère une connexion cliente TCP.
+ * Lit un octet de commande :
+ *   'L' → fork + exec "ls -l <reppub>", stdout/stderr redirigés sur fd.
+ * fd est fermé avant de retourner.
+ */
+void envoiContenu(int fd)
+{
+    unsigned char code;
+    pid_t         pid;
+
+    if (read(fd, &code, 1) != 1) {
+        close(fd);
+        return;
+    }
+
+    if (code == 'L') {
+        pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            close(fd);
+            return;
+        }
+        if (pid == 0) {
+            /* fils : redirige stdout et stderr vers le socket client */
+            dup2(fd, STDOUT_FILENO);
+            dup2(fd, STDERR_FILENO);
+            close(fd);
+            execlp("ls", "ls", "-l", reppub, (char *)NULL);
+            perror("execlp");
+            _exit(1);
+        }
+        /* père : attend la fin du ls avant de fermer la connexion */
+        waitpid(pid, NULL, 0);
+    }
+
+    close(fd);
+}
+
+/*
+ * serveur_tcp - thread serveur TCP de partage de fichiers
+ * rep : répertoire public (reppub, déjà positionné par command_beuip_start)
+ *
+ * Protocole : le client envoie "LIST\n", "GET <nom>\n" ou "BYE\n".
+ * S'arrête dès que stop_requested est positionné à 1.
+ */
+void *serveur_tcp(void *rep)
+{
+    int                sid, cfd, yes;
+    struct sockaddr_in conf, client;
+    socklen_t          clen;
+    fd_set             fds;
+    struct timeval     tv;
+
+    (void)rep; /* reppub déjà positionné avant pthread_create */
+
+    sid = socket(AF_INET, SOCK_STREAM, 0);
+    if (sid < 0) { perror("socket(tcp)"); return NULL; }
+
+    yes = 1;
+    if (setsockopt(sid, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1)
+        perror("setsockopt(SO_REUSEADDR)");
+
+    memset(&conf, 0, sizeof(conf));
+    conf.sin_family = AF_INET;
+    conf.sin_port   = htons(CREME_PORT);
+    if (local_ip[0] != '\0')
+        inet_aton(local_ip, &conf.sin_addr);
+    else
+        conf.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(sid, (struct sockaddr *)&conf, sizeof(conf)) == -1) {
+        perror("bind(tcp)");
+        close(sid);
+        return NULL;
+    }
+    if (listen(sid, 5) == -1) {
+        perror("listen");
+        close(sid);
+        return NULL;
+    }
+
+    printf("Serveur TCP démarré, port %d, reppub=%s\n", CREME_PORT, reppub);
+
+    for (;;) {
+        if (stop_requested) break;
+
+        FD_ZERO(&fds);
+        FD_SET(sid, &fds);
+        tv.tv_sec  = 1;
+        tv.tv_usec = 0;
+        if (select(sid + 1, &fds, NULL, NULL, &tv) <= 0)
+            continue;
+
+        clen = sizeof(client);
+        cfd  = accept(sid, (struct sockaddr *)&client, &clen);
+        if (cfd < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+            perror("accept");
+            continue;
+        }
+        envoiContenu(cfd);
+    }
+
+    close(sid);
+    printf("Arrêt du serveur TCP\n");
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
 /*                     Commande beuip start                            */
 /* ------------------------------------------------------------------ */
 
-static int command_beuip_start(const char *pseudo, const char *ip)
+static int command_beuip_start(const char *pseudo, const char *ip, const char *dir)
 {
     if (beuip_started) {
         fprintf(stderr, "beuip start ne peut être fait qu'une seule fois\n");
@@ -766,13 +953,25 @@ static int command_beuip_start(const char *pseudo, const char *ip)
         local_ip[0] = '\0';
     }
 
+    if (dir != NULL && dir[0] != '\0') {
+        strncpy(reppub, dir, sizeof(reppub) - 1);
+        reppub[sizeof(reppub) - 1] = '\0';
+    }
+
     if (pthread_create(&server_tid, NULL, serveur_udp, udp_pseudo) != 0) {
-        perror("pthread_create");
+        perror("pthread_create(udp)");
         return 2;
+    }
+    if (pthread_create(&tcp_tid, NULL, serveur_tcp, reppub) != 0) {
+        perror("pthread_create(tcp)");
+        stop_requested = 1;
+        pthread_join(server_tid, NULL);
+        return 3;
     }
 
     beuip_started = 1;
     beuip_active  = 1;
+    tcp_active    = 1;
 
     run_repl();
 
@@ -787,19 +986,20 @@ static int command_beuip_start(const char *pseudo, const char *ip)
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: biceps beuip start <pseudo> [<ip_locale>]\n");
+        fprintf(stderr, "Usage: biceps beuip start <pseudo> [<ip_locale>] [<reppub>]\n");
         return 1;
     }
 
     if (strcmp(argv[1], "beuip") == 0) {
         if (argc >= 4 && strcmp(argv[2], "start") == 0) {
-            const char *ip = (argc >= 5) ? argv[4] : NULL;
-            return command_beuip_start(argv[3], ip);
+            const char *ip  = (argc >= 5) ? argv[4] : NULL;
+            const char *dir = (argc >= 6) ? argv[5] : NULL;
+            return command_beuip_start(argv[3], ip, dir);
         }
-        fprintf(stderr, "Usage: biceps beuip start <pseudo> [<ip_locale>]\n");
+        fprintf(stderr, "Usage: biceps beuip start <pseudo> [<ip_locale>] [<reppub>]\n");
         return 2;
     }
 
-    fprintf(stderr, "Commande inconnue. Usage: biceps beuip start <pseudo> [<ip_locale>]\n");
+    fprintf(stderr, "Commande inconnue. Usage: biceps beuip start <pseudo> [<ip_locale>] [<reppub>]\n");
     return 3;
 }
