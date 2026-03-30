@@ -6,6 +6,8 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <ifaddrs.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -19,9 +21,17 @@
 /* ------------------------------------------------------------------ */
 /* Variables partagées entre l'interpréteur et le thread serveur UDP  */
 /* ------------------------------------------------------------------ */
-static creme_peer_t    peers[CREME_MAX_PEERS];
-static int             peer_count     = 0;
-static pthread_mutex_t peers_mutex    = PTHREAD_MUTEX_INITIALIZER;
+
+/* Liste chaînée des pairs (remplace le tableau fixe peers[])         */
+#define LPSEUDO 23
+struct elt {
+    char       nom[LPSEUDO + 1]; /* pseudo de l'élément               */
+    char       adip[16];         /* adresse IPv4 sous forme de chaîne */
+    struct elt *next;            /* prochain élément                  */
+};
+
+static struct elt     *head          = NULL;
+static pthread_mutex_t peers_mutex   = PTHREAD_MUTEX_INITIALIZER;
 static volatile int    stop_requested = 0;
 
 /* Pseudo et IP locaux (écrits une seule fois avant la création du thread) */
@@ -29,51 +39,170 @@ static char udp_pseudo[256];
 static char local_ip[16]; /* ex: "127.0.0.1" — vide = INADDR_ANY */
 
 /* État du serveur : démarré une seule fois, actif ou non */
-static int        beuip_started = 0; /* a-t-on déjà appelé beuip start ? */
-static int        beuip_active  = 0; /* le thread tourne-t-il encore ?   */
+static int        beuip_started = 0;
+static int        beuip_active  = 0;
 static pthread_t  server_tid;
 
 /* ------------------------------------------------------------------ */
-/* Fonctions de gestion de la liste de pairs (appelées sous mutex)    */
+/* Gestion de la liste chaînée de pairs                               */
 /* ------------------------------------------------------------------ */
 
-static void add_peer_locked(uint32_t ip, const char *pseudo)
+/*
+ * ajouteElt - insère (pseudo, adip) dans la liste, triée par ordre
+ * alphabétique croissant sur le pseudo. Ignoré si pseudo déjà présent.
+ * Appelé par le serveur UDP (sous mutex).
+ */
+void ajouteElt(char *pseudo, char *adip)
 {
-    int i;
-    char ip_text[16];
+    struct elt *e, *cur, *prev;
 
-    for (i = 0; i < peer_count; ++i) {
-        if (peers[i].ip == ip && strcmp(peers[i].pseudo, pseudo) == 0)
-            return;
-    }
-    if (peer_count >= CREME_MAX_PEERS)
-        return;
+    pthread_mutex_lock(&peers_mutex);
 
-    peers[peer_count].ip = ip;
-    strncpy(peers[peer_count].pseudo, pseudo,
-            sizeof(peers[peer_count].pseudo) - 1);
-    peers[peer_count].pseudo[sizeof(peers[peer_count].pseudo) - 1] = '\0';
-    ++peer_count;
-
-    creme_addrip(ip, ip_text, sizeof(ip_text));
-    printf("[+] present: %s (%s)\n", pseudo, ip_text);
-}
-
-static void remove_peer_locked(uint32_t ip, const char *pseudo)
-{
-    int i, j;
-    char ip_text[16];
-
-    for (i = 0; i < peer_count; ++i) {
-        if (peers[i].ip == ip && strcmp(peers[i].pseudo, pseudo) == 0) {
-            for (j = i; j < peer_count - 1; ++j)
-                peers[j] = peers[j + 1];
-            --peer_count;
-            creme_addrip(ip, ip_text, sizeof(ip_text));
-            printf("[-] left: %s (%s)\n", pseudo, ip_text);
+    /* Vérifie l'unicité du pseudo */
+    for (cur = head; cur != NULL; cur = cur->next) {
+        if (strcmp(cur->nom, pseudo) == 0) {
+            pthread_mutex_unlock(&peers_mutex);
             return;
         }
     }
+
+    e = malloc(sizeof(struct elt));
+    if (e == NULL) {
+        pthread_mutex_unlock(&peers_mutex);
+        return;
+    }
+    strncpy(e->nom,  pseudo, LPSEUDO);
+    e->nom[LPSEUDO] = '\0';
+    strncpy(e->adip, adip, 15);
+    e->adip[15] = '\0';
+    e->next = NULL;
+
+    /* Insertion en ordre alphabétique */
+    if (head == NULL || strcmp(pseudo, head->nom) < 0) {
+        e->next = head;
+        head    = e;
+    } else {
+        prev = head;
+        cur  = head->next;
+        while (cur != NULL && strcmp(pseudo, cur->nom) > 0) {
+            prev = cur;
+            cur  = cur->next;
+        }
+        e->next    = cur;
+        prev->next = e;
+    }
+
+    pthread_mutex_unlock(&peers_mutex);
+    printf("[+] present: %s (%s)\n", pseudo, adip);
+}
+
+/*
+ * supprimeElt - supprime le pair identifié par son adresse IP.
+ * Appelé par le serveur UDP (sous mutex).
+ */
+void supprimeElt(char *adip)
+{
+    struct elt *cur, *prev = NULL;
+
+    pthread_mutex_lock(&peers_mutex);
+
+    cur = head;
+    while (cur != NULL) {
+        if (strcmp(cur->adip, adip) == 0) {
+            if (prev == NULL)
+                head = cur->next;
+            else
+                prev->next = cur->next;
+            printf("[-] left: %s (%s)\n", cur->nom, cur->adip);
+            free(cur);
+            pthread_mutex_unlock(&peers_mutex);
+            return;
+        }
+        prev = cur;
+        cur  = cur->next;
+    }
+
+    pthread_mutex_unlock(&peers_mutex);
+}
+
+/*
+ * listeElts - affiche tous les pairs connus.
+ * Appelée par le thread principal via la commande « mess list ».
+ */
+void listeElts(void)
+{
+    struct elt *cur;
+    int i = 1;
+
+    pthread_mutex_lock(&peers_mutex);
+    printf("---- pairs connus ----\n");
+    for (cur = head; cur != NULL; cur = cur->next)
+        printf("%3d | %-24s | %s\n", i++, cur->nom, cur->adip);
+    printf("----------------------\n");
+    pthread_mutex_unlock(&peers_mutex);
+}
+
+/*
+ * findAdipByNom - retourne l'adresse IP du pair dont le pseudo est nom.
+ * Retourne 1 si trouvé (adip_out rempli), 0 sinon.
+ */
+static int findAdipByNom(const char *nom, char *adip_out, size_t out_sz)
+{
+    struct elt *cur;
+    int found = 0;
+
+    pthread_mutex_lock(&peers_mutex);
+    for (cur = head; cur != NULL; cur = cur->next) {
+        if (strcmp(cur->nom, nom) == 0) {
+            strncpy(adip_out, cur->adip, out_sz - 1);
+            adip_out[out_sz - 1] = '\0';
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&peers_mutex);
+    return found;
+}
+
+/*
+ * findNomByAdip - retourne le pseudo du pair à l'adresse adip.
+ * Retourne 1 si trouvé (nom_out rempli), 0 sinon.
+ */
+static int findNomByAdip(const char *adip, char *nom_out, size_t out_sz)
+{
+    struct elt *cur;
+    int found = 0;
+
+    pthread_mutex_lock(&peers_mutex);
+    for (cur = head; cur != NULL; cur = cur->next) {
+        if (strcmp(cur->adip, adip) == 0) {
+            strncpy(nom_out, cur->nom, out_sz - 1);
+            nom_out[out_sz - 1] = '\0';
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&peers_mutex);
+    return found;
+}
+
+/*
+ * collectAdips - copie toutes les adresses IP connues dans le tableau.
+ * Retourne le nombre d'entrées copiées.
+ */
+static int collectAdips(char adips[][16], int max)
+{
+    struct elt *cur;
+    int n = 0;
+
+    pthread_mutex_lock(&peers_mutex);
+    for (cur = head; cur != NULL && n < max; cur = cur->next) {
+        strncpy(adips[n], cur->adip, 15);
+        adips[n][15] = '\0';
+        ++n;
+    }
+    pthread_mutex_unlock(&peers_mutex);
+    return n;
 }
 
 /* ------------------------------------------------------------------ */
@@ -93,29 +222,64 @@ static int set_recv_timeout(int sid)
     return 1;
 }
 
-static int send_quit_broadcast(int sid, const char *my_pseudo)
+/*
+ * broadcast_on_all_interfaces - envoie un message BEUIP (code + pseudo)
+ * en broadcast sur toutes les interfaces IPv4 actives sauf loopback.
+ *
+ * Utilise getifaddrs() pour énumérer les interfaces et getnameinfo()
+ * avec ifa_broadaddr pour obtenir l'adresse broadcast de chacune.
+ */
+static void broadcast_on_all_interfaces(int sid, char code, const char *my_pseudo)
 {
-    char buf[CREME_LBUF + 1];
+    struct ifaddrs *ifaddr, *ifa;
+    char msg[CREME_LBUF + 1];
+    char bcast_str[NI_MAXHOST];
     int msg_len;
-    struct sockaddr_in bcast;
+    struct sockaddr_in dst;
 
-    memset(&bcast, 0, sizeof(bcast));
-    bcast.sin_family = AF_INET;
-    bcast.sin_port   = htons(CREME_PORT);
-    if (inet_aton(CREME_BCAST_ADDR, &bcast.sin_addr) == 0) {
-        fprintf(stderr, "Adresse broadcast invalide: %s\n", CREME_BCAST_ADDR);
-        return 0;
-    }
-    msg_len = creme_build_message(buf, sizeof(buf), CREME_CODE_QUIT, my_pseudo);
+    msg_len = creme_build_message(msg, sizeof(msg), code, my_pseudo);
     if (msg_len < 0)
-        return 0;
-    /* QUIT (octet1='0') est sans AR */
-    if (sendto(sid, buf, (size_t)msg_len, 0,
-               (struct sockaddr *)&bcast, sizeof(bcast)) == -1) {
-        perror("sendto(quit broadcast)");
-        return 0;
+        return;
+
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs");
+        return;
     }
-    return 1;
+
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        /* Ignorer les interfaces sans adresse ou sans broadcast */
+        if (ifa->ifa_addr == NULL || ifa->ifa_broadaddr == NULL)
+            continue;
+
+        /* Ne traiter que les interfaces IPv4 */
+        if (ifa->ifa_addr->sa_family != AF_INET)
+            continue;
+
+        /* Ignorer le loopback (127.x.x.x) */
+        if (((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr ==
+            htonl(INADDR_LOOPBACK))
+            continue;
+
+        /* Récupérer l'adresse broadcast sous forme de chaîne */
+        if (getnameinfo(ifa->ifa_broadaddr, sizeof(struct sockaddr_in),
+                        bcast_str, sizeof(bcast_str),
+                        NULL, 0, NI_NUMERICHOST) != 0)
+            continue;
+
+        memset(&dst, 0, sizeof(dst));
+        dst.sin_family = AF_INET;
+        dst.sin_port   = htons(CREME_PORT);
+        if (inet_aton(bcast_str, &dst.sin_addr) == 0)
+            continue;
+
+        if (sendto(sid, msg, (size_t)msg_len, 0,
+                   (struct sockaddr *)&dst, sizeof(dst)) == -1)
+            perror("sendto(broadcast)");
+        else
+            printf("Broadcast '%c' -> %s (%s)\n", code, bcast_str, ifa->ifa_name);
+    }
+
+    freeifaddrs(ifaddr);
 }
 
 /*
@@ -130,13 +294,11 @@ void *serveur_udp(void *p)
 {
     const char *my_pseudo = (const char *)p;
     int sid, yes, msg_len, payload_len;
-    struct sockaddr_in sock_conf, from, bcast;
+    struct sockaddr_in sock_conf, from;
     socklen_t from_len;
     char buf[CREME_LBUF + 1];
     char peer_pseudo[CREME_LBUF + 1];
     char text[CREME_LBUF + 1];
-    uint32_t from_ip;
-    const char *sender;
     char ip_text[16];
     int copy_len;
 
@@ -179,29 +341,14 @@ void *serveur_udp(void *p)
         return NULL;
     }
 
-    memset(&bcast, 0, sizeof(bcast));
-    bcast.sin_family = AF_INET;
-    bcast.sin_port   = htons(CREME_PORT);
-    if (inet_aton(CREME_BCAST_ADDR, &bcast.sin_addr) == 0) {
-        fprintf(stderr, "Adresse broadcast invalide: %s\n", CREME_BCAST_ADDR);
-        close(sid);
-        return NULL;
-    }
-
-    msg_len = creme_build_message(buf, sizeof(buf), CREME_CODE_DISCOVERY, my_pseudo);
-    if (msg_len > 0) {
-        if (sendto(sid, buf, (size_t)msg_len, 0,
-                   (struct sockaddr *)&bcast, sizeof(bcast)) == -1)
-            perror("sendto(discovery)");
-        else
-            printf("Broadcast de découverte envoyé (%s)\n", CREME_BCAST_ADDR);
-    }
+    /* Envoi du DISCOVERY sur toutes les interfaces actives (détection auto) */
+    broadcast_on_all_interfaces(sid, CREME_CODE_DISCOVERY, my_pseudo);
 
     printf("Serveur UDP démarré, port %d, pseudo=%s\n", CREME_PORT, my_pseudo);
 
     for (;;) {
         if (stop_requested) {
-            send_quit_broadcast(sid, my_pseudo);
+            broadcast_on_all_interfaces(sid, CREME_CODE_QUIT, my_pseudo);
             printf("Arrêt du serveur UDP\n");
             break;
         }
@@ -223,35 +370,24 @@ void *serveur_udp(void *p)
 
         buf[msg_len] = '\0';
         payload_len  = msg_len - (1 + CREME_MAGIC_LEN);
-        from_ip      = ntohl(from.sin_addr.s_addr);
+        /* Adresse IP source sous forme de chaîne pour la liste chaînée */
+        creme_addrip(ntohl(from.sin_addr.s_addr), ip_text, sizeof(ip_text));
 
         switch (buf[0]) {
 
         /* --- Codes réseau légitimes --- */
 
         case CREME_CODE_QUIT: /* '0' — sans AR */
-            if (payload_len > 0) {
-                copy_len = (payload_len < CREME_LBUF) ? payload_len : CREME_LBUF;
-                memcpy(peer_pseudo, buf + 1 + CREME_MAGIC_LEN, (size_t)copy_len);
-                peer_pseudo[copy_len] = '\0';
-                pthread_mutex_lock(&peers_mutex);
-                remove_peer_locked(from_ip, peer_pseudo);
-                pthread_mutex_unlock(&peers_mutex);
-            }
+            supprimeElt(ip_text);
             break;
 
         case CREME_CODE_DELIVER: /* '9' — sans AR */
             if (creme_copy_payload_text(buf + 1 + CREME_MAGIC_LEN,
                                         payload_len, text, sizeof(text))) {
-                pthread_mutex_lock(&peers_mutex);
-                sender = creme_find_pseudo_by_ip(peers, peer_count, from_ip);
-                if (sender) {
-                    printf("\nMessage de %s : %s\n", sender, text);
-                } else {
-                    creme_addrip(from_ip, ip_text, sizeof(ip_text));
+                if (findNomByAdip(ip_text, peer_pseudo, sizeof(peer_pseudo)))
+                    printf("\nMessage de %s : %s\n", peer_pseudo, text);
+                else
                     printf("\nMessage de %s : %s\n", ip_text, text);
-                }
-                pthread_mutex_unlock(&peers_mutex);
             }
             break;
 
@@ -261,9 +397,7 @@ void *serveur_udp(void *p)
                 copy_len = (payload_len < CREME_LBUF) ? payload_len : CREME_LBUF;
                 memcpy(peer_pseudo, buf + 1 + CREME_MAGIC_LEN, (size_t)copy_len);
                 peer_pseudo[copy_len] = '\0';
-                pthread_mutex_lock(&peers_mutex);
-                add_peer_locked(from_ip, peer_pseudo);
-                pthread_mutex_unlock(&peers_mutex);
+                ajouteElt(peer_pseudo, ip_text);
             }
             if (buf[0] == CREME_CODE_DISCOVERY) {
                 msg_len = creme_build_message(buf, sizeof(buf),
@@ -281,14 +415,12 @@ void *serveur_udp(void *p)
         case CREME_CODE_LIST:           /* '3' */
         case CREME_CODE_SEND_TO_PSEUDO: /* '4' */
         case CREME_CODE_SEND_TO_ALL:    /* '5' */
-            creme_addrip(from_ip, ip_text, sizeof(ip_text));
             fprintf(stderr,
                     "[!] octet1='%c' rejeté depuis %s — commande interne sur le réseau\n",
                     buf[0], ip_text);
             break;
 
         default:
-            creme_addrip(from_ip, ip_text, sizeof(ip_text));
             fprintf(stderr,
                     "[!] octet1='%c' inconnu depuis %s\n", buf[0], ip_text);
             break;
@@ -317,22 +449,15 @@ static int  open_send_socket(void);
 void commande(char octet1, char *message, char *pseudo)
 {
     int i, n, sid, msg_len;
-    uint32_t target_ip, ips[CREME_MAX_PEERS];
+    char adips[CREME_MAX_PEERS][16];
+    char target_adip[16];
     char buf[CREME_LBUF + 1];
-    char ip_text[16];
     struct sockaddr_in dst;
 
     switch (octet1) {
 
-    case CREME_CODE_LIST: /* '3' — liste des pairs */
-        pthread_mutex_lock(&peers_mutex);
-        printf("---- pairs connus (%d) ----\n", peer_count);
-        for (i = 0; i < peer_count; ++i) {
-            creme_addrip(peers[i].ip, ip_text, sizeof(ip_text));
-            printf("%3d | %-24s | %s\n", i + 1, peers[i].pseudo, ip_text);
-        }
-        printf("---------------------------\n");
-        pthread_mutex_unlock(&peers_mutex);
+    case CREME_CODE_LIST: /* '3' — délègue à listeElts */
+        listeElts();
         break;
 
     case CREME_CODE_SEND_TO_PSEUDO: /* '4' — message à un pseudo */
@@ -340,21 +465,19 @@ void commande(char octet1, char *message, char *pseudo)
             fprintf(stderr, "commande: pseudo ou message manquant\n");
             return;
         }
+        if (!findAdipByNom(pseudo, target_adip, sizeof(target_adip))) {
+            printf("[!] pseudo inconnu: %s\n", pseudo);
+            return;
+        }
         msg_len = creme_build_message(buf, sizeof(buf), CREME_CODE_DELIVER, message);
         if (msg_len < 0) { fprintf(stderr, "Message trop long\n"); return; }
-
-        pthread_mutex_lock(&peers_mutex);
-        n = creme_find_ip_by_pseudo(peers, peer_count, pseudo, &target_ip);
-        pthread_mutex_unlock(&peers_mutex);
-
-        if (!n) { printf("[!] pseudo inconnu: %s\n", pseudo); return; }
 
         sid = open_send_socket();
         if (sid < 0) return;
         memset(&dst, 0, sizeof(dst));
-        dst.sin_family      = AF_INET;
-        dst.sin_port        = htons(CREME_PORT);
-        dst.sin_addr.s_addr = htonl(target_ip);
+        dst.sin_family = AF_INET;
+        dst.sin_port   = htons(CREME_PORT);
+        inet_aton(target_adip, &dst.sin_addr);
         if (sendto(sid, buf, (size_t)msg_len, 0,
                    (struct sockaddr *)&dst, sizeof(dst)) == -1)
             perror("sendto(deliver)");
@@ -368,20 +491,16 @@ void commande(char octet1, char *message, char *pseudo)
         msg_len = creme_build_message(buf, sizeof(buf), CREME_CODE_DELIVER, message);
         if (msg_len < 0) { fprintf(stderr, "Message trop long\n"); return; }
 
-        pthread_mutex_lock(&peers_mutex);
-        n = peer_count;
-        for (i = 0; i < n; ++i) ips[i] = peers[i].ip;
-        pthread_mutex_unlock(&peers_mutex);
-
+        n = collectAdips(adips, CREME_MAX_PEERS);
         if (n == 0) { printf("Aucun pair connu\n"); return; }
 
         sid = open_send_socket();
         if (sid < 0) return;
         for (i = 0; i < n; ++i) {
             memset(&dst, 0, sizeof(dst));
-            dst.sin_family      = AF_INET;
-            dst.sin_port        = htons(CREME_PORT);
-            dst.sin_addr.s_addr = htonl(ips[i]);
+            dst.sin_family = AF_INET;
+            dst.sin_port   = htons(CREME_PORT);
+            inet_aton(adips[i], &dst.sin_addr);
             if (sendto(sid, buf, (size_t)msg_len, 0,
                        (struct sockaddr *)&dst, sizeof(dst)) == -1)
                 perror("sendto(all)");
@@ -453,14 +572,11 @@ static int open_send_socket(void)
 static void do_beuip_stop(void)
 {
     int i, n, sid, msg_len;
-    uint32_t ips[CREME_MAX_PEERS];
+    char adips[CREME_MAX_PEERS][16];
     char buf[CREME_LBUF + 1];
     struct sockaddr_in dst;
 
-    pthread_mutex_lock(&peers_mutex);
-    n = peer_count;
-    for (i = 0; i < n; ++i) ips[i] = peers[i].ip;
-    pthread_mutex_unlock(&peers_mutex);
+    n = collectAdips(adips, CREME_MAX_PEERS);
 
     msg_len = creme_build_message(buf, sizeof(buf), CREME_CODE_QUIT, udp_pseudo);
     if (msg_len > 0 && n > 0) {
@@ -468,9 +584,9 @@ static void do_beuip_stop(void)
         if (sid >= 0) {
             for (i = 0; i < n; ++i) {
                 memset(&dst, 0, sizeof(dst));
-                dst.sin_family      = AF_INET;
-                dst.sin_port        = htons(CREME_PORT);
-                dst.sin_addr.s_addr = htonl(ips[i]);
+                dst.sin_family = AF_INET;
+                dst.sin_port   = htons(CREME_PORT);
+                inet_aton(adips[i], &dst.sin_addr);
                 /* QUIT sans AR */
                 sendto(sid, buf, (size_t)msg_len, 0,
                        (struct sockaddr *)&dst, sizeof(dst));
@@ -485,17 +601,17 @@ static void do_beuip_stop(void)
 
 static void repl_mess_add(const char *pseudo, const char *ip_str)
 {
+    /* Vérifie que l'IP est valide avant d'appeler ajouteElt */
     struct in_addr addr;
-    uint32_t ip;
+    char ip_copy[16];
 
     if (inet_aton(ip_str, &addr) == 0) {
         fprintf(stderr, "Adresse IP invalide: %s\n", ip_str);
         return;
     }
-    ip = ntohl(addr.s_addr);
-    pthread_mutex_lock(&peers_mutex);
-    add_peer_locked(ip, pseudo);
-    pthread_mutex_unlock(&peers_mutex);
+    strncpy(ip_copy, ip_str, 15);
+    ip_copy[15] = '\0';
+    ajouteElt((char *)pseudo, ip_copy);
 }
 
 /* ------------------------------------------------------------------ */
