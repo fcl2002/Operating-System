@@ -23,8 +23,14 @@ servbeuip : servbeuip.c creme.h $(CREME_SO)
 clibeuip : clibeuip.c creme.h $(CREME_SO)
 	$(CC) $(CFLAGS) -o clibeuip clibeuip.c -L. -lcreme -Wl,-rpath,'$$ORIGIN'
 
+
+# Compilações com e sem TRACE
 biceps : biceps.c creme.h $(CREME_SO)
 	$(CC) $(CFLAGS) -o biceps biceps.c -L. -lcreme -Wl,-rpath,'$$ORIGIN' -lpthread
+
+biceps-trace : biceps.c creme.h $(CREME_SO)
+	$(CC) $(CFLAGS) -DTRACE_ON -o biceps-trace biceps.c -L. -lcreme -Wl,-rpath,'$$ORIGIN' -lpthread
+
 
 clean :
 	rm -f cliudp servudp servbeuip clibeuip biceps creme.o libcreme.so libcreme.so.1 libcreme.so.*

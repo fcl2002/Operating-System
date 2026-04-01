@@ -23,6 +23,16 @@
 #include <sys/wait.h>
 
 /* ------------------------------------------------------------------ */
+/* Macro de trace conditionnelle (activée par -DTRACE_ON) */
+/* ------------------------------------------------------------------ */
+
+#ifdef TRACE_ON
+#define TRACE(fmt, ...) fprintf(stderr, "[TRACE] " fmt "\n", ##__VA_ARGS__)
+#else
+#define TRACE(...) ((void)0)
+#endif
+
+/* ------------------------------------------------------------------ */
 /* Variables partagées entre l'interpréteur et le thread serveur UDP  */
 /* ------------------------------------------------------------------ */
 
@@ -103,6 +113,7 @@ void ajouteElt(char *pseudo, char *adip)
 
     pthread_mutex_unlock(&peers_mutex);
     printf("[+] present: %s (%s)\n", pseudo, adip);
+    TRACE("ajouteElt: par %s (%s)", pseudo, adip);
 }
 
 /*
@@ -123,6 +134,7 @@ void supprimeElt(char *adip)
             else
                 prev->next = cur->next;
             printf("[-] left: %s (%s)\n", cur->nom, cur->adip);
+            TRACE("supprimeElt: removido %s (%s)", cur->nom, cur->adip);
             free(cur);
             pthread_mutex_unlock(&peers_mutex);
             return;
@@ -214,6 +226,27 @@ static int collectAdips(char adips[][16], int max)
     return n;
 }
 
+/*
+ * collectPeers - copie les pseudos et IPs de tous les pairs connus.
+ * Retourne le nombre d'entrées copiées.
+ */
+static int collectPeers(char noms[][LPSEUDO + 1], char adips[][16], int max)
+{
+    struct elt *cur;
+    int n = 0;
+
+    pthread_mutex_lock(&peers_mutex);
+    for (cur = head; cur != NULL && n < max; cur = cur->next) {
+        strncpy(noms[n], cur->nom, LPSEUDO);
+        noms[n][LPSEUDO] = '\0';
+        strncpy(adips[n], cur->adip, 15);
+        adips[n][15] = '\0';
+        ++n;
+    }
+    pthread_mutex_unlock(&peers_mutex);
+    return n;
+}
+
 /* ------------------------------------------------------------------ */
 /*                       Thread serveur UDP                            */
 /* ------------------------------------------------------------------ */
@@ -282,10 +315,13 @@ static void broadcast_on_all_interfaces(int sid, char code, const char *my_pseud
             continue;
 
         if (sendto(sid, msg, (size_t)msg_len, 0,
-                   (struct sockaddr *)&dst, sizeof(dst)) == -1)
+                   (struct sockaddr *)&dst, sizeof(dst)) == -1) {
             perror("sendto(broadcast)");
-        else
+            TRACE("broadcast_on_all_interfaces: erro ao enviar para %s (%s)", bcast_str, ifa->ifa_name);
+        } else {
             printf("Broadcast '%c' -> %s (%s)\n", code, bcast_str, ifa->ifa_name);
+            TRACE("broadcast_on_all_interfaces: enviado '%c' para %s (%s)", code, bcast_str, ifa->ifa_name);
+        }
     }
 
     freeifaddrs(ifaddr);
@@ -354,11 +390,13 @@ void *serveur_udp(void *p)
     broadcast_on_all_interfaces(sid, CREME_CODE_DISCOVERY, my_pseudo);
 
     printf("Serveur UDP démarré, port %d, pseudo=%s\n", CREME_PORT, my_pseudo);
+    TRACE("serveur_udp démarré (pseudo=%s)", my_pseudo);
 
     for (;;) {
         if (stop_requested) {
             broadcast_on_all_interfaces(sid, CREME_CODE_QUIT, my_pseudo);
             printf("Arrêt du serveur UDP\n");
+            TRACE("serveur_udp: arrêt demandé");
             break;
         }
 
@@ -369,6 +407,7 @@ void *serveur_udp(void *p)
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                 continue;
             perror("recvfrom");
+            TRACE("serveur_udp: erro de recvfrom");
             continue;
         }
 
@@ -382,17 +421,21 @@ void *serveur_udp(void *p)
         /* Adresse IP source sous forme de chaîne pour la liste chaînée */
         creme_addrip(ntohl(from.sin_addr.s_addr), ip_text, sizeof(ip_text));
 
+        TRACE("serveur_udp: recebido '%c' de %s", buf[0], ip_text);
+
         switch (buf[0]) {
 
         /* --- Codes réseau légitimes --- */
 
         case CREME_CODE_QUIT: /* '0' — sans AR */
+            TRACE("UDP QUIT reçu de %s", ip_text);
             supprimeElt(ip_text);
             break;
 
         case CREME_CODE_DELIVER: /* '9' — sans AR */
             if (creme_copy_payload_text(buf + 1 + CREME_MAGIC_LEN,
                                         payload_len, text, sizeof(text))) {
+                TRACE("UDP DELIVER de %s : '%s'", ip_text, text);
                 if (findNomByAdip(ip_text, peer_pseudo, sizeof(peer_pseudo)))
                     printf("\nMessage de %s : %s\n", peer_pseudo, text);
                 else
@@ -406,6 +449,9 @@ void *serveur_udp(void *p)
                 copy_len = (payload_len < CREME_LBUF) ? payload_len : CREME_LBUF;
                 memcpy(peer_pseudo, buf + 1 + CREME_MAGIC_LEN, (size_t)copy_len);
                 peer_pseudo[copy_len] = '\0';
+                  TRACE("UDP %s de %s (pseudo='%s')",
+                      buf[0] == CREME_CODE_DISCOVERY ? "DISCOVERY" : "ACK",
+                      ip_text, peer_pseudo);
                 ajouteElt(peer_pseudo, ip_text);
             }
             if (buf[0] == CREME_CODE_DISCOVERY) {
@@ -466,10 +512,12 @@ void commande(char octet1, char *message, char *pseudo)
     switch (octet1) {
 
     case CREME_CODE_LIST: /* '3' — délègue à listeElts */
+        TRACE("commande: LIST");
         listeElts();
         break;
 
     case CREME_CODE_SEND_TO_PSEUDO: /* '4' — message à un pseudo */
+        TRACE("commande: SEND_TO_PSEUDO para %s", pseudo ? pseudo : "(null)");
         if (pseudo == NULL || pseudo[0] == '\0' || message == NULL) {
             fprintf(stderr, "commande: pseudo ou message manquant\n");
             return;
@@ -488,14 +536,18 @@ void commande(char octet1, char *message, char *pseudo)
         dst.sin_port   = htons(CREME_PORT);
         inet_aton(target_adip, &dst.sin_addr);
         if (sendto(sid, buf, (size_t)msg_len, 0,
-                   (struct sockaddr *)&dst, sizeof(dst)) == -1)
+                   (struct sockaddr *)&dst, sizeof(dst)) == -1) {
             perror("sendto(deliver)");
-        else
+            TRACE("commande: erro ao enviar para %s", pseudo);
+        } else {
             printf("Message envoyé à %s\n", pseudo);
+            TRACE("commande: mensagem enviada para %s", pseudo);
+        }
         close(sid);
         break;
 
     case CREME_CODE_SEND_TO_ALL: /* '5' — message à tous */
+        TRACE("commande: SEND_TO_ALL");
         if (message == NULL) { fprintf(stderr, "commande: message manquant\n"); return; }
         msg_len = creme_build_message(buf, sizeof(buf), CREME_CODE_DELIVER, message);
         if (msg_len < 0) { fprintf(stderr, "Message trop long\n"); return; }
@@ -511,8 +563,12 @@ void commande(char octet1, char *message, char *pseudo)
             dst.sin_port   = htons(CREME_PORT);
             inet_aton(adips[i], &dst.sin_addr);
             if (sendto(sid, buf, (size_t)msg_len, 0,
-                       (struct sockaddr *)&dst, sizeof(dst)) == -1)
+                       (struct sockaddr *)&dst, sizeof(dst)) == -1) {
                 perror("sendto(all)");
+                TRACE("commande: erro ao enviar para %s", adips[i]);
+            } else {
+                TRACE("commande: mensagem enviada para %s", adips[i]);
+            }
         }
         close(sid);
         printf("Message diffusé à %d pair(s)\n", n);
@@ -520,6 +576,7 @@ void commande(char octet1, char *message, char *pseudo)
 
     default:
         fprintf(stderr, "commande: octet1 non géré '%c'\n", octet1);
+        TRACE("commande: octet1 não gerenciado '%c'", octet1);
         break;
     }
 }
@@ -665,7 +722,7 @@ void demandeListe(char *pseudo)
  * Contrôles : pseudo inconnu, nom invalide, fichier local déjà présent,
  * fichier distant absent (EOF immédiat).
  */
-void demandeFichier(char *pseudo, char *nomfic)
+int demandeFichier(char *pseudo, char *nomfic)
 {
     char               adip[16];
     int                sid;
@@ -679,24 +736,24 @@ void demandeFichier(char *pseudo, char *nomfic)
 
     if (!findAdipByNom(pseudo, adip, sizeof(adip))) {
         printf("[!] pseudo inconnu : %s\n", pseudo);
-        return;
+        return 0;
     }
 
     /* Validation du nom de fichier */
     if (nomfic[0] == '\0' || strchr(nomfic, '/') != NULL || nomfic[0] == '.') {
         fprintf(stderr, "[!] nom de fichier invalide : %s\n", nomfic);
-        return;
+        return 0;
     }
 
     /* Refus si un fichier local du même nom existe déjà */
     snprintf(localpath, sizeof(localpath), "%s/%s", reppub, nomfic);
     if (access(localpath, F_OK) == 0) {
         fprintf(stderr, "[!] fichier '%s' déjà présent localement\n", nomfic);
-        return;
+        return 0;
     }
 
     sid = socket(AF_INET, SOCK_STREAM, 0);
-    if (sid < 0) { perror("socket"); return; }
+    if (sid < 0) { perror("socket"); return 0; }
 
     memset(&dst, 0, sizeof(dst));
     dst.sin_family = AF_INET;
@@ -704,12 +761,15 @@ void demandeFichier(char *pseudo, char *nomfic)
     if (inet_aton(adip, &dst.sin_addr) == 0) {
         fprintf(stderr, "Adresse IP invalide : %s\n", adip);
         close(sid);
-        return;
+        return 0;
     }
+
+    TRACE("demandeFichier: connexion à %s pour '%s'", adip, nomfic);
+
     if (connect(sid, (struct sockaddr *)&dst, sizeof(dst)) == -1) {
         perror("connect");
         close(sid);
-        return;
+        return 0;
     }
 
     /* Envoie 'F' + nom + '\n' */
@@ -717,7 +777,7 @@ void demandeFichier(char *pseudo, char *nomfic)
     if (write(sid, req, strlen(req)) != (ssize_t)strlen(req)) {
         perror("write");
         close(sid);
-        return;
+        return 0;
     }
 
     /* Lire la première réponse pour détecter fichier absent (EOF immédiat) */
@@ -725,7 +785,7 @@ void demandeFichier(char *pseudo, char *nomfic)
     if (n <= 0) {
         printf("[!] fichier '%s' absent chez %s\n", nomfic, pseudo);
         close(sid);
-        return;
+        return 0;
     }
 
     /* Ouvrir le fichier local et sauvegarder */
@@ -733,7 +793,7 @@ void demandeFichier(char *pseudo, char *nomfic)
     if (f == NULL) {
         perror("fopen");
         close(sid);
-        return;
+        return 0;
     }
 
     received = 0;
@@ -744,7 +804,43 @@ void demandeFichier(char *pseudo, char *nomfic)
 
     fclose(f);
     close(sid);
+    TRACE("demandeFichier: %d octets reçus pour '%s'", received, nomfic);
     printf("Fichier '%s' reçu (%d octets) dans %s/\n", nomfic, received, reppub);
+    return 1;
+}
+
+/*
+ * demandeTrouveFichier - parcourt tous les pairs connus et télécharge nomfic
+ * chez le premier pair qui le possède.
+ */
+void demandeTrouveFichier(char *nomfic)
+{
+    char noms[CREME_MAX_PEERS][LPSEUDO + 1];
+    char adips[CREME_MAX_PEERS][16];
+    int  n, i;
+    char localpath[512];
+
+    /* Vérification préalable : fichier local déjà présent */
+    snprintf(localpath, sizeof(localpath), "%s/%s", reppub, nomfic);
+    if (access(localpath, F_OK) == 0) {
+        fprintf(stderr, "[!] fichier '%s' déjà présent localement\n", nomfic);
+        return;
+    }
+
+    n = collectPeers(noms, adips, CREME_MAX_PEERS);
+    if (n == 0) {
+        printf("Aucun pair connu\n");
+        return;
+    }
+
+    TRACE("demandeTrouveFichier: recherche '%s' chez %d pair(s)", nomfic, n);
+
+    for (i = 0; i < n; ++i) {
+        printf("Recherche '%s' chez %s (%s)...\n", nomfic, noms[i], adips[i]);
+        if (demandeFichier(noms[i], nomfic))
+            return; /* trouvé et téléchargé */
+    }
+    printf("Fichier '%s' introuvable chez tous les pairs connus\n", nomfic);
 }
 
 static void repl_mess_add(const char *pseudo, const char *ip_str)
@@ -940,6 +1036,8 @@ void envoiContenu(int fd)
         return;
     }
 
+    TRACE("envoiContenu: code='%c' reçu", code);
+
     if (code == 'L') {
         pid = fork();
         if (pid < 0) {
@@ -974,6 +1072,8 @@ void envoiContenu(int fd)
         }
 
         snprintf(path, sizeof(path), "%s/%s", reppub, filename);
+
+        TRACE("envoiContenu: fichier demandé='%s' (path=%s)", filename, path);
 
         /* Si le fichier n'existe pas, fermeture sans envoi (EOF pour le client) */
         if (access(path, R_OK) != 0) {
@@ -1045,6 +1145,7 @@ void *serveur_tcp(void *rep)
     }
 
     printf("Serveur TCP démarré, port %d, reppub=%s\n", CREME_PORT, reppub);
+    TRACE("serveur_tcp démarré (reppub=%s)", reppub);
 
     for (;;) {
         if (stop_requested) break;
@@ -1064,6 +1165,7 @@ void *serveur_tcp(void *rep)
             perror("accept");
             continue;
         }
+        TRACE("TCP connexion acceptée");
         envoiContenu(cfd);
     }
 
