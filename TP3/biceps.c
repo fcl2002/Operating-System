@@ -53,7 +53,6 @@ static char udp_pseudo[256];
 static char local_ip[16]; /* ex: "127.0.0.1" — vide = INADDR_ANY */
 
 /* État du serveur : démarré une seule fois, actif ou non */
-static int        beuip_started = 0;
 static int        beuip_active  = 0;
 static pthread_t  server_tid;
 
@@ -153,13 +152,28 @@ void supprimeElt(char *adip)
 void listeElts(void)
 {
     struct elt *cur;
-    int i = 1;
 
     pthread_mutex_lock(&peers_mutex);
-    printf("---- pairs connus ----\n");
     for (cur = head; cur != NULL; cur = cur->next)
-        printf("%3d | %-24s | %s\n", i++, cur->nom, cur->adip);
-    printf("----------------------\n");
+        printf("%s : %s\n", cur->adip, cur->nom);
+    pthread_mutex_unlock(&peers_mutex);
+}
+
+/*
+ * clearElts - libère toute la liste des pairs.
+ */
+static void clearElts(void)
+{
+    struct elt *cur, *next;
+
+    pthread_mutex_lock(&peers_mutex);
+    cur = head;
+    while (cur != NULL) {
+        next = cur->next;
+        free(cur);
+        cur = next;
+    }
+    head = NULL;
     pthread_mutex_unlock(&peers_mutex);
 }
 
@@ -449,6 +463,8 @@ void *serveur_udp(void *p)
                 copy_len = (payload_len < CREME_LBUF) ? payload_len : CREME_LBUF;
                 memcpy(peer_pseudo, buf + 1 + CREME_MAGIC_LEN, (size_t)copy_len);
                 peer_pseudo[copy_len] = '\0';
+                if (strcmp(peer_pseudo, my_pseudo) == 0)
+                    break;
                   TRACE("UDP %s de %s (pseudo='%s')",
                       buf[0] == CREME_CODE_DISCOVERY ? "DISCOVERY" : "ACK",
                       ip_text, peer_pseudo);
@@ -500,6 +516,7 @@ void *serveur_udp(void *p)
 static void build_text(char **args, int start, int argc,
                         char *out, size_t out_sz);
 static int  open_send_socket(void);
+static int command_beuip_start(const char *pseudo, const char *ip, const char *dir);
 
 void commande(char octet1, char *message, char *pseudo)
 {
@@ -888,7 +905,7 @@ static void run_repl(void)
     int   argc;
     char  text[CREME_LBUF + 1];
 
-    printf("BEUIP actif. Tapez 'aide' pour la liste des commandes.\n");
+    printf("BEUIP. Tapez 'aide' pour la liste des commandes.\n");
 
     for (;;) {
         printf("biceps> ");
@@ -902,6 +919,53 @@ static void run_repl(void)
 
         /* --- beuip stop / beuip start --- */
         if (strcmp(args[0], "beuip") == 0 && argc >= 2) {
+            if (strcmp(args[1], "start") == 0) {
+                const char *ip = NULL;
+                const char *dir = NULL;
+
+                if (argc < 3) {
+                    fprintf(stderr, "Usage: beuip start <pseudo> [<ip_locale>] [<reppub>]\n");
+                    continue;
+                }
+                if (argc >= 4)
+                    ip = args[3];
+                if (argc >= 5)
+                    dir = args[4];
+                if (argc > 5) {
+                    fprintf(stderr, "Usage: beuip start <pseudo> [<ip_locale>] [<reppub>]\n");
+                    continue;
+                }
+
+                if (command_beuip_start(args[2], ip, dir) == 0)
+                    printf("BEUIP démarré.\n");
+                continue;
+            }
+            if (strcmp(args[1], "list") == 0) {
+                if (!beuip_active) {
+                    fprintf(stderr, "Serveur non actif\n");
+                    continue;
+                }
+                commande(CREME_CODE_LIST, NULL, NULL);
+                continue;
+            }
+            if (strcmp(args[1], "message") == 0) {
+                if (!beuip_active) {
+                    fprintf(stderr, "Serveur non actif\n");
+                    continue;
+                }
+                if (argc < 4) {
+                    fprintf(stderr, "Usage: beuip message <user|all> <message>\n");
+                    continue;
+                }
+                if (strcmp(args[2], "all") == 0) {
+                    build_text(args, 3, argc, text, sizeof(text));
+                    commande(CREME_CODE_SEND_TO_ALL, text, NULL);
+                } else {
+                    build_text(args, 3, argc, text, sizeof(text));
+                    commande(CREME_CODE_SEND_TO_PSEUDO, text, args[2]);
+                }
+                continue;
+            }
             if (strcmp(args[1], "ls") == 0) {
                 if (argc != 3) {
                     fprintf(stderr, "Usage: beuip ls <pseudo>\n");
@@ -926,15 +990,12 @@ static void run_repl(void)
                 do_beuip_stop();
                 pthread_join(server_tid, NULL);
                 if (tcp_active) { pthread_join(tcp_tid, NULL); tcp_active = 0; }
+                clearElts();
                 beuip_active = 0;
                 printf("Serveurs arrêtés. Tapez 'quit' pour quitter.\n");
                 continue;
             }
-            if (strcmp(args[1], "start") == 0) {
-                fprintf(stderr, "Serveur déjà démarré (une seule fois par session)\n");
-                continue;
-            }
-            fprintf(stderr, "Usage: beuip stop\n");
+            fprintf(stderr, "Usage: beuip start|list|message|ls|get|stop ...\n");
             continue;
         }
 
@@ -985,6 +1046,9 @@ static void run_repl(void)
         /* --- aide --- */
         if (strcmp(args[0], "aide") == 0 || strcmp(args[0], "help") == 0) {
             printf("Commandes disponibles:\n");
+            printf("  beuip start <pseudo> [<ip_locale>] [<reppub>] - démarrer les serveurs\n");
+            printf("  beuip list                 - lister les utilisateurs présents\n");
+            printf("  beuip message <u|all> <m>  - envoyer un message à un utilisateur ou à tous\n");
             printf("  mess add <pseudo> <ip>     - enregistrer un pair manuellement\n");
             printf("  mess list                  - lister les pairs connus\n");
             printf("  mess to <pseudo> <message> - envoyer à un pair\n");
@@ -1004,6 +1068,7 @@ static void run_repl(void)
         do_beuip_stop();
         pthread_join(server_tid, NULL);
         if (tcp_active) { pthread_join(tcp_tid, NULL); tcp_active = 0; }
+        clearElts();
         beuip_active = 0;
     }
 }
@@ -1180,10 +1245,13 @@ void *serveur_tcp(void *rep)
 
 static int command_beuip_start(const char *pseudo, const char *ip, const char *dir)
 {
-    if (beuip_started) {
-        fprintf(stderr, "beuip start ne peut être fait qu'une seule fois\n");
+    if (beuip_active) {
+        fprintf(stderr, "Serveur déjà actif\n");
         return 1;
     }
+
+    stop_requested = 0;
+    clearElts();
 
     strncpy(udp_pseudo, pseudo, sizeof(udp_pseudo) - 1);
     udp_pseudo[sizeof(udp_pseudo) - 1] = '\0';
@@ -1212,13 +1280,8 @@ static int command_beuip_start(const char *pseudo, const char *ip, const char *d
         return 3;
     }
 
-    beuip_started = 1;
     beuip_active  = 1;
     tcp_active    = 1;
-
-    run_repl();
-
-    printf("BEUIP arrêté\n");
     return 0;
 }
 
@@ -1228,16 +1291,19 @@ static int command_beuip_start(const char *pseudo, const char *ip, const char *d
 
 int main(int argc, char *argv[])
 {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: biceps beuip start <pseudo> [<ip_locale>] [<reppub>]\n");
-        return 1;
+    if (argc == 1) {
+        run_repl();
+        return 0;
     }
 
     if (strcmp(argv[1], "beuip") == 0) {
         if (argc >= 4 && strcmp(argv[2], "start") == 0) {
             const char *ip  = (argc >= 5) ? argv[4] : NULL;
             const char *dir = (argc >= 6) ? argv[5] : NULL;
-            return command_beuip_start(argv[3], ip, dir);
+            if (command_beuip_start(argv[3], ip, dir) != 0)
+                return 1;
+            run_repl();
+            return 0;
         }
         fprintf(stderr, "Usage: biceps beuip start <pseudo> [<ip_locale>] [<reppub>]\n");
         return 2;
