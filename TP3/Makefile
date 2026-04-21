@@ -1,5 +1,6 @@
 CC = cc
 CFLAGS = -Wall -Werror
+MEMLEAK_CFLAGS = -Wall -Werror -g -O0
 CREME_VER = 1.0.0
 CREME_SO = libcreme.so.$(CREME_VER)
 
@@ -31,7 +32,12 @@ biceps : biceps.c creme.h $(CREME_SO)
 biceps-trace : biceps.c creme.h $(CREME_SO)
 	$(CC) $(CFLAGS) -DTRACE_ON -o biceps-trace biceps.c -L. -lcreme -Wl,-rpath,'$$ORIGIN' -lpthread
 
+biceps-memory-leaks : biceps.c creme.h $(CREME_SO)
+	$(CC) $(MEMLEAK_CFLAGS) -o biceps-memory-leaks biceps.c -L. -lcreme -Wl,-rpath,'$$ORIGIN' -lpthread
+
+memory-leak : biceps-memory-leaks
+
 
 clean :
-	rm -f cliudp servudp servbeuip clibeuip biceps creme.o libcreme.so libcreme.so.1 libcreme.so.*
+	rm -f cliudp servudp servbeuip clibeuip biceps biceps-trace biceps-memory-leaks mess creme.o libcreme.so libcreme.so.1 libcreme.so.* pub/contacts
 
