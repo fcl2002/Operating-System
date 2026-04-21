@@ -1,3 +1,7 @@
+NOM: ROSIM DE SOUSA,COSTA LASMAR
+
+PRENOM: Flavio,Fernando
+
 # TP3 — BEUIP : Évolutions architecturales
 
 Suite du TP2. Ce TP fait évoluer `biceps` sur trois axes : modèle de concurrence, détection réseau automatique et échange de fichiers.
@@ -7,28 +11,32 @@ Suite du TP2. Ce TP fait évoluer `biceps` sur trois axes : modèle de concurren
 ## Compilation
 
 ```bash
-make              # version normale
-make biceps       # recompile uniquement biceps
+make              # compile tout et produit ./biceps
+make memory-leak  # compile avec -g -O0 pour valgrind -> ./biceps-memory-leaks
+make clean        # nettoie tous les exécutables et .o
 ```
 
 Pour activer les traces de débogage :
 
 ```bash
-cc -Wall -Werror -DTRACE_ON -o biceps biceps.c -L. -lcreme -Wl,-rpath,'$ORIGIN' -lpthread
+make biceps-trace # compile biceps avec -DTRACE_ON
 ```
 
 `-DTRACE_ON` active la macro `TRACE` qui affiche sur stderr les événements internes : ajout/suppression de pairs, paquets UDP reçus, connexions TCP, transferts de fichiers.
 
 ---
-
-## Utilisation
+Lancez `./biceps` pour entrer dans le REPL interactif. Les serveurs UDP et TCP doivent d'abord être démarrés avec `beuip start`.
 
 ```bash
-./biceps beuip start <pseudo> [<ip_locale>] [<reppub>]
+./biceps
+biceps> beuip start <pseudo> [<ip_locale>] [<reppub>]
 ```
 
-- `<ip_locale>` : adresse locale (utile pour deux instances en loopback : `127.0.0.1` / `127.0.0.2`).
-- `<reppub>` : répertoire public exposé via TCP (défaut : `pub`). Doit exister avant le démarrage.
+### Paramètres de `beuip start`
+
+- `<pseudo>` : pseudo de l'utilisateur local.
+- `<ip_locale>` (optionnel) : adresse locale (utile pour deux instances en loopback : `127.0.0.1` / `127.0.0.2`).
+- `<reppub>` (optionnel) : répertoire public exposé via TCP (défaut : `pub`). Doit exister avant le démarrage.
 
 ---
 
@@ -36,11 +44,16 @@ cc -Wall -Werror -DTRACE_ON -o biceps biceps.c -L. -lcreme -Wl,-rpath,'$ORIGIN' 
 
 | Commande | Description |
 |---|---|
-| `mess add <pseudo> <ip>` | Enregistrer un pair manuellement |
-| `mess list` | Lister les pairs connus |
-| `mess to <pseudo> <message>` | Envoyer un message à un pair |
-| `mess all <message>` | Diffuser un message à tous les pairs |
+| `beuip start <pseudo> [<ip>] [<rep>]` | Démarrer les serveurs UDP/TCP |
+| `beuip list` | Afficher la liste des utilisateurs : `<IP> : <pseudo>` |
+| `beuip message <user\|all> <message>` | Envoyer un message à un utilisateur ou à tous |
 | `beuip ls <pseudo>` | Lister les fichiers du `reppub` d'un pair |
+| `beuip get <pseudo> <nomfic>` | Télécharger un fichier depuis le `reppub` d'un pair |
+| `beuip stop` | Arrêter les serveurs UDP et TCP |
+| `mess add <pseudo> <ip>` | Enregistrer un pair manuellement (legacy) |
+| `mess list` | Lister les pairs connus (legacy) |
+| `mess to <pseudo> <message>` | Envoyer un message à un pair (legacy) |
+| `mess all <message>` | Diffuser un message à tous les pairs (legacy)reppub` d'un pair |
 | `beuip get <pseudo> <nomfic>` | Télécharger un fichier depuis le `reppub` d'un pair |
 | `beuip find <nomfic>` | Chercher et télécharger `nomfic` chez tous les pairs |
 | `beuip stop` | Arrêter les serveurs UDP et TCP |
